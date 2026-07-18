@@ -110,14 +110,17 @@ handle_call({chacha20_poly1305_module, M}, _From, State) ->
 	ChaCha20Poly1305Module = check_chacha20_poly1305_module(M),
 	Entries = lists:flatten(check_crypto(?CRYPTO_FALLBACK, [{chacha20_poly1305_module, ChaCha20Poly1305Module}])),
 	_ = ets:select_delete(?TAB, [{{{cipher, '_'}, '_'}, [], [true]}]),
+	true = ets:delete(?TAB, crypto_supports_external),
 	true = ets:insert(?TAB, Entries),
 	{reply, ok, State};
 handle_call({curve25519_module, M}, _From, State) ->
 	Curve25519Module = check_curve25519_module(M),
+	true = ets:delete(?TAB, crypto_supports_external),
 	true = ets:insert(?TAB, {curve25519_module, Curve25519Module}),
 	{reply, ok, State};
 handle_call({curve448_module, M}, _From, State) ->
 	Curve448Module = check_curve448_module(M),
+	true = ets:delete(?TAB, crypto_supports_external),
 	true = ets:insert(?TAB, {curve448_module, Curve448Module}),
 	{reply, ok, State};
 handle_call({json_module, M}, _From, State) ->
@@ -129,6 +132,7 @@ handle_call({pbes2_count_maximum, PBES2CountMaximum}, _From, State) when is_inte
 	{reply, ok, State};
 handle_call({sha3_module, M}, _From, State) ->
 	SHA3Module = check_sha3_module(M),
+	true = ets:delete(?TAB, crypto_supports_external),
 	true = ets:insert(?TAB, {sha3_module, SHA3Module}),
 	{reply, ok, State};
 handle_call({unsecured_signing, UnsecuredSigning}, _From, State) when is_boolean(UnsecuredSigning) ->
@@ -336,9 +340,8 @@ check_curve25519_modules(Fallback, [Module | Modules]) ->
 	case code:ensure_loaded(Module) of
 		{module, Module} ->
 			_ = application:ensure_all_started(Module),
-			RealFallback = jose_jwa_curve25519,
 			RealModule = check_curve25519_module(Module),
-			try check_curve25519_module_does_it_work(RealFallback, RealModule) of
+			try check_curve25519_module_does_it_work(RealModule) of
 				true ->
 					RealModule;
 				false ->
@@ -354,26 +357,41 @@ check_curve25519_modules(Fallback, []) ->
 	Fallback.
 
 %% @private
-check_curve25519_module_does_it_work(Fallback, Module) ->
-	{PK, SK = <<Secret:32/binary, _:32/binary>>} = Module:eddsa_keypair(),
+check_curve25519_module_does_it_work(Module) ->
+	{GeneratedPK, <<GeneratedSecret:32/binary, GeneratedPK:32/binary>>} = Module:eddsa_keypair(),
+	GeneratedPK = Module:eddsa_secret_to_public(GeneratedSecret),
+	%% RFC 8032, section 7.1, blank-message Ed25519 test vector.
+	BlankSecret = base64:decode(<<
+		"nWGyPkrYNjJyl6j2RX9R71uEJfnCY1qWb0H8Qs+c9vA="
+	>>),
+	BlankPK = base64:decode(<<
+		"11qYAYdk9JMCdjR2QYEE8yL4h9tYNaG7N+aF6R1YlkI="
+	>>),
+	BlankSignature = base64:decode(<<
+		"5Vb7cXgEcj7uHLiRPB8YPhAsgubLhxy9Hh2j9xG5VZlM9gJ3fxQZE2zBvmNsM5ELaXaBKqYcptLW"
+		"sI6N9gXjAA=="
+	>>),
+	true = check_ed25519_vector(Module, BlankSecret, BlankPK, <<>>, BlankSignature),
+	%% RFC 8032, section 7.1, one-octet Ed25519 test vector.
+	NonemptySecret = base64:decode(<<
+		"TM0Imyj/ltqdtsNG7BFOD1uKMZ81q6Yk2oz27U+4pvs="
+	>>),
+	NonemptyPK = base64:decode(<<
+		"PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw="
+	>>),
+	NonemptySignature = base64:decode(<<
+		"kqAJqfDUyrhyDoILX2QlQKKye1QWUD+Ps3YiI+vbadoIWsHkPhWZbkWPNhPQ8R2MOHsurrQwKu6w"
+		"DSkWErsMAA=="
+	>>),
+	true = check_ed25519_vector(Module, NonemptySecret, NonemptyPK, <<16#72>>, NonemptySignature),
+	true.
+
+%% @private
+check_ed25519_vector(Module, Secret, PK, Message, Signature) ->
 	{PK, SK} = Module:eddsa_keypair(Secret),
 	PK = Module:eddsa_secret_to_public(Secret),
-	Message = crypto:strong_rand_bytes(16),
 	Signature = Module:ed25519_sign(Message, SK),
-	true = Module:ed25519_verify(Signature, Message, PK),
-	true = Fallback:ed25519_verify(Signature, Message, PK),
-	%% NOTE: Ed25519ctx and Ed25519ph are lower priority, no need to check for now.
-	% Ctx = <<"ctx">>,
-	% CtxSignature = Module:ed25519ctx_sign(Message, SK, Ctx),
-	% true = Module:ed25519ctx_verify(CtxSignature, Message, PK, Ctx),
-	% true = Fallback:ed25519ctx_verify(CtxSignature, Message, PK, Ctx),
-	% PHSignature = Module:ed25519ph_sign(Message, SK),
-	% true = Module:ed25519ph_verify(PHSignature, Message, PK),
-	% true = Fallback:ed25519ph_verify(PHSignature, Message, PK),
-	% CtxPHSignature = Module:ed25519ph_sign(Message, SK, Ctx),
-	% true = Module:ed25519ph_verify(CtxPHSignature, Message, PK, Ctx),
-	% true = Fallback:ed25519ph_verify(CtxPHSignature, Message, PK, Ctx),
-	true.
+	true = Module:ed25519_verify(Signature, Message, PK).
 
 %% @private
 check_curve448(false, Entries) ->
@@ -430,17 +448,32 @@ check_curve448_module_does_it_work(Module) ->
 	{GeneratedPK, <<GeneratedSecret:57/binary, GeneratedPK:57/binary>>} = Module:eddsa_keypair(),
 	GeneratedPK = Module:eddsa_secret_to_public(GeneratedSecret),
 	%% RFC 8032, section 7.4, blank-message Ed448 test vector.
-	Secret = base64:decode(<<
+	BlankSecret = base64:decode(<<
 		"bIKlYsuAjRDWMr6JyFE+v2ySnzTd+oyfY8mWDvbjSKNSjIo/zC8ETjmj/FuUSS+PAy51SaIAmPlb"
 	>>),
-	PK = base64:decode(<<
+	BlankPK = base64:decode(<<
 		"X9dEm1m0Yf0s54fsYWrUah2hNCSFpw4fig6nXYDpZ3jt8SR2m0bHBhvWeD3x5Q9s0foavq/oJWGA"
 	>>),
-	Signature = base64:decode(<<
+	BlankSignature = base64:decode(<<
 		"Uzo39rvkVyUfAjwNiPl2ri37UEqEPjTSB0/YI9QaWR8rIz8DT2KCgfL9eiLd1H14KMWb0KIb/TmA/"
 		"w0gKNSxip32PgBsXRwtNFuSXY3AC0EEhS25msXHzdqFMKEToPTbthFJ8FpzYyaMcdlYCP8uZSYA"
 	>>),
-	Message = <<>>,
+	true = check_ed448_vector(Module, BlankSecret, BlankPK, <<>>, BlankSignature),
+	%% RFC 8032, section 7.4, one-octet Ed448 test vector.
+	NonemptySecret = base64:decode(<<
+		"xOqwXTVwB8Yy89u0hImSTVUrCP4MNToNSh8ArNosRjr76mfF6NKHfF47w5emWZSe+AIelU4KEidO"
+	>>),
+	NonemptyPK = base64:decode(<<
+		"Q7oo9DDN/0Vq5TFUX37NCsg0pV2TWMA3K/oMbGeYwIZq6gHrAHQoArhDjqTLghacI1FgYntMOpSA"
+	>>),
+	NonemptySignature = base64:decode(<<
+		"Jrj5Fye9Yol68V5B60PDd++5xhDUjyM1ywvQCHgQ9DUlQbFDxLmBt+GPYt6MzfYz/BvwN6t813mA"
+		"Xg28wKrhy87hr7LgJ982vATc7L8VQzbBnwr34KZHKQXnmfGVPSoP8zSKshqkra/R0jREHPgHwDoA"
+	>>),
+	true = check_ed448_vector(Module, NonemptySecret, NonemptyPK, <<16#03>>, NonemptySignature).
+
+%% @private
+check_ed448_vector(Module, Secret, PK, Message, Signature) ->
 	{PK, SK} = Module:eddsa_keypair(Secret),
 	PK = Module:eddsa_secret_to_public(Secret),
 	Signature = Module:ed448_sign(Message, SK),

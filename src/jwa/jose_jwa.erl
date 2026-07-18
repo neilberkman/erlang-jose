@@ -185,18 +185,7 @@ crypto_supports() ->
 		[{'=/=', '$2', 'jose_jwa_unsupported'}],
 		['$1']
 	}])),
-	ExternalHashs = external_checks([
-		{poly1305, fun() -> jose_chacha20_poly1305:authenticate(<<>>, <<0:256>>, <<0:96>>) end},
-		{shake256, fun() -> jose_sha3:shake256(<<>>, 0) end}
-	]),
-	ExternalPublicKeys = external_checks([
-		{ed25519, fun() -> check_eddsa(jose_curve25519, ed25519_sign, ed25519_verify) end},
-		{ed25519ph, fun() -> check_eddsa(jose_curve25519, ed25519ph_sign, ed25519ph_verify) end},
-		{ed448, fun() -> check_eddsa(jose_curve448, ed448_sign, ed448_verify) end},
-		{ed448ph, fun() -> check_eddsa(jose_curve448, ed448ph_sign, ed448ph_verify) end},
-		{x25519, fun jose_curve25519:x25519_keypair/0},
-		{x448, fun jose_curve448:x448_keypair/0}
-	]),
+	{ExternalHashs, ExternalPublicKeys} = external_supports(),
 	Supports = crypto:supports(),
 	RecommendedHashs = [md5, poly1305, sha, sha256, sha384, sha512, shake256],
 	Hashs = RecommendedHashs -- ((RecommendedHashs -- proplists:get_value(hashs, Supports)) -- ExternalHashs),
@@ -419,6 +408,37 @@ external_checks([{Key, Check} | Checks], Acc) ->
 	end;
 external_checks([], Acc) ->
 	lists:reverse(Acc).
+
+%% @private
+external_supports() ->
+	%% The dispatch modules and fallback setting cover every operation below.
+	%% Runtime setters either change this key or explicitly clear the entry.
+	CacheKey = {
+		crypto_fallback(),
+		ets:lookup_element(?TAB, chacha20_poly1305_module, 2),
+		ets:lookup_element(?TAB, sha3_module, 2),
+		ets:lookup_element(?TAB, curve25519_module, 2),
+		ets:lookup_element(?TAB, curve448_module, 2)
+	},
+	case ets:lookup(?TAB, crypto_supports_external) of
+		[{crypto_supports_external, CacheKey, ExternalHashs, ExternalPublicKeys}] ->
+			{ExternalHashs, ExternalPublicKeys};
+		_ ->
+			ExternalHashs = external_checks([
+				{poly1305, fun() -> jose_chacha20_poly1305:authenticate(<<>>, <<0:256>>, <<0:96>>) end},
+				{shake256, fun() -> jose_sha3:shake256(<<>>, 0) end}
+			]),
+			ExternalPublicKeys = external_checks([
+				{ed25519, fun() -> check_eddsa(jose_curve25519, ed25519_sign, ed25519_verify) end},
+				{ed25519ph, fun() -> check_eddsa(jose_curve25519, ed25519ph_sign, ed25519ph_verify) end},
+				{ed448, fun() -> check_eddsa(jose_curve448, ed448_sign, ed448_verify) end},
+				{ed448ph, fun() -> check_eddsa(jose_curve448, ed448ph_sign, ed448ph_verify) end},
+				{x25519, fun jose_curve25519:x25519_keypair/0},
+				{x448, fun jose_curve448:x448_keypair/0}
+			]),
+			true = ets:insert(?TAB, {crypto_supports_external, CacheKey, ExternalHashs, ExternalPublicKeys}),
+			{ExternalHashs, ExternalPublicKeys}
+	end.
 
 %% @private
 rsa_crypt(Algorithm) ->

@@ -4,7 +4,8 @@
 
 * Fixes
   * Detect native OTP Ed448 support without requiring the pure Erlang cryptographic fallback; see [#198](https://github.com/potatosalad/erlang-jose/issues/198).
-  * Report Ed25519, Ed25519ph, Ed448, and Ed448ph support only when their signing and verification operations are available.
+  * Validate native and optional Ed25519 and Ed448 adapters against fallback-independent RFC 8032 test vectors.
+  * Report Ed25519, Ed25519ph, Ed448, and Ed448ph support only when their signing and verification operations are available, caching those operational checks until their adapter configuration changes.
 
 ## 1.11.12 (2025-11-20)
 
