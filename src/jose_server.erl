@@ -18,6 +18,8 @@
 %% API
 -export([start_link/0]).
 -export([config_change/0]).
+-export([cache_crypto_supports/4]).
+-export([crypto_supports/0]).
 -export([chacha20_poly1305_module/1]).
 -export([curve25519_module/1]).
 -export([curve448_module/1]).
@@ -61,6 +63,21 @@ start_link() ->
 
 config_change() ->
 	gen_server:call(?SERVER, config_change).
+
+crypto_supports() ->
+	%% Snapshot configuration in the server, but run operational adapter probes
+	%% in the caller so a slow custom module cannot block configuration changes.
+	Snapshot = gen_server:call(?SERVER, crypto_supports_snapshot, infinity),
+	jose_jwa:crypto_supports_internal(Snapshot).
+
+cache_crypto_supports(Generation, CacheKey, ExternalHashs, ExternalPublicKeys) ->
+	gen_server:call(?SERVER, {
+		cache_crypto_supports,
+		Generation,
+		CacheKey,
+		ExternalHashs,
+		ExternalPublicKeys
+	}, infinity).
 
 chacha20_poly1305_module(ChaCha20Poly1305Module) when is_atom(ChaCha20Poly1305Module) ->
 	gen_server:call(?SERVER, {chacha20_poly1305_module, ChaCha20Poly1305Module}).
@@ -106,22 +123,24 @@ init([]) ->
 %% @private
 handle_call(config_change, _From, State) ->
 	{reply, support_check(), State};
+handle_call(crypto_supports_snapshot, _From, State) ->
+	{reply, crypto_supports_snapshot(), State};
+handle_call({cache_crypto_supports, Generation, CacheKey, ExternalHashs, ExternalPublicKeys}, _From, State) ->
+	Reply = cache_crypto_supports_internal(Generation, CacheKey, ExternalHashs, ExternalPublicKeys),
+	{reply, Reply, State};
 handle_call({chacha20_poly1305_module, M}, _From, State) ->
 	ChaCha20Poly1305Module = check_chacha20_poly1305_module(M),
 	Entries = lists:flatten(check_crypto(?CRYPTO_FALLBACK, [{chacha20_poly1305_module, ChaCha20Poly1305Module}])),
 	_ = ets:select_delete(?TAB, [{{{cipher, '_'}, '_'}, [], [true]}]),
-	true = ets:delete(?TAB, crypto_supports_external),
-	true = ets:insert(?TAB, Entries),
+	ok = update_crypto_supports_entries(Entries),
 	{reply, ok, State};
 handle_call({curve25519_module, M}, _From, State) ->
 	Curve25519Module = check_curve25519_module(M),
-	true = ets:delete(?TAB, crypto_supports_external),
-	true = ets:insert(?TAB, {curve25519_module, Curve25519Module}),
+	ok = update_crypto_supports_entries([{curve25519_module, Curve25519Module}]),
 	{reply, ok, State};
 handle_call({curve448_module, M}, _From, State) ->
 	Curve448Module = check_curve448_module(M),
-	true = ets:delete(?TAB, crypto_supports_external),
-	true = ets:insert(?TAB, {curve448_module, Curve448Module}),
+	ok = update_crypto_supports_entries([{curve448_module, Curve448Module}]),
 	{reply, ok, State};
 handle_call({json_module, M}, _From, State) ->
 	JSONModule = check_json_module(M),
@@ -132,8 +151,7 @@ handle_call({pbes2_count_maximum, PBES2CountMaximum}, _From, State) when is_inte
 	{reply, ok, State};
 handle_call({sha3_module, M}, _From, State) ->
 	SHA3Module = check_sha3_module(M),
-	true = ets:delete(?TAB, crypto_supports_external),
-	true = ets:insert(?TAB, {sha3_module, SHA3Module}),
+	ok = update_crypto_supports_entries([{sha3_module, SHA3Module}]),
 	{reply, ok, State};
 handle_call({unsecured_signing, UnsecuredSigning}, _From, State) when is_boolean(UnsecuredSigning) ->
 	true = ets:insert(?TAB, {unsecured_signing, UnsecuredSigning}),
@@ -146,7 +164,7 @@ handle_call({xchacha20_poly1305_module, M}, _From, State) ->
 	XChaCha20Poly1305Module = check_xchacha20_poly1305_module(M),
 	Entries = lists:flatten(check_crypto(?CRYPTO_FALLBACK, [{xchacha20_poly1305_module, XChaCha20Poly1305Module}])),
 	_ = ets:select_delete(?TAB, [{{{cipher, '_'}, '_'}, [], [true]}]),
-	true = ets:insert(?TAB, Entries),
+	ok = update_crypto_supports_entries(Entries),
 	{reply, ok, State};
 handle_call(_Request, _From, State) ->
 	{reply, ignore, State}.
@@ -198,6 +216,8 @@ support_check() ->
 		fun check_public_key/2
 	])),
 	Entries2 = [
+		{crypto_fallback_applied, Fallback},
+		{crypto_supports_generation, make_ref()},
 		{pbes2_count_maximum, PBES2CountMaximum},
 		{unsecured_signing, UnsecuredSigning}
 		| Entries1
@@ -205,6 +225,86 @@ support_check() ->
 	true = ets:delete_all_objects(?TAB),
 	true = ets:insert(?TAB, Entries2),
 	ok.
+
+%% @private
+update_crypto_supports_entries(Entries) ->
+	true = ets:delete(?TAB, crypto_supports_external),
+	true = ets:insert(?TAB, Entries),
+	true = ets:insert(?TAB, {crypto_supports_generation, make_ref()}),
+	ok.
+
+%% @private
+crypto_supports_snapshot() ->
+	%% A normal code load does not necessarily invoke code_change/3. An older
+	%% running server therefore needs its table migrated lazily on the first
+	%% capability read after this module is loaded. Reconcile direct application
+	%% environment changes as well, including a setter process that exited after
+	%% writing the environment but before calling config_change/0.
+	CurrentFallback = application:get_env(jose, crypto_fallback, false),
+	case {
+		ets:lookup(?TAB, crypto_supports_generation),
+		ets:lookup(?TAB, crypto_fallback_applied)
+	} of
+		{
+			[{crypto_supports_generation, _}],
+			[{crypto_fallback_applied, CurrentFallback}]
+		} ->
+			ok;
+		_ ->
+			support_check()
+	end,
+	#{
+		generation => ets:lookup_element(?TAB, crypto_supports_generation, 2),
+		crypto_fallback => ets:lookup_element(?TAB, crypto_fallback_applied, 2),
+		ciphers => ets:select(?TAB, [{
+			{{cipher, '$1'}, {'$2', '_'}},
+			[{'=/=', '$2', jose_jwa_unsupported}],
+			['$1']
+		}]),
+		rsa_crypt => ets:select(?TAB, [{
+			{{rsa_crypt, '$1'}, {'$2', '_'}},
+			[{'=/=', '$2', jose_jwa_unsupported}],
+			['$1']
+		}]),
+		rsa_sign => ets:select(?TAB, [{
+			{{rsa_sign, '$1'}, {'$2', '_'}},
+			[{'=/=', '$2', jose_jwa_unsupported}],
+			['$1']
+		}]),
+		chacha20_poly1305_module => ets:lookup_element(?TAB, chacha20_poly1305_module, 2),
+		sha3_module => ets:lookup_element(?TAB, sha3_module, 2),
+		curve25519_module => ets:lookup_element(?TAB, curve25519_module, 2),
+		curve448_module => ets:lookup_element(?TAB, curve448_module, 2),
+		crypto_supports_external => ets:lookup(?TAB, crypto_supports_external)
+	}.
+
+%% @private
+cache_crypto_supports_internal(Generation, CacheKey, ExternalHashs, ExternalPublicKeys) ->
+	AppliedFallback = ets:lookup(?TAB, crypto_fallback_applied),
+	CurrentFallback = application:get_env(jose, crypto_fallback, false),
+	case {
+		ets:lookup(?TAB, crypto_supports_generation),
+		AppliedFallback
+	} of
+		{
+			[{crypto_supports_generation, Generation}],
+			[{crypto_fallback_applied, CurrentFallback}]
+		} ->
+			case ets:lookup(?TAB, crypto_supports_external) of
+				[{crypto_supports_external, CacheKey, CachedHashs, CachedPublicKeys}] ->
+					{ok, CachedHashs, CachedPublicKeys};
+				_ ->
+					true = ets:insert(?TAB, {
+						crypto_supports_external,
+						CacheKey,
+						ExternalHashs,
+						ExternalPublicKeys
+					}),
+					{ok, ExternalHashs, ExternalPublicKeys}
+			end;
+		_ ->
+			stale
+	end.
 
 %%%-------------------------------------------------------------------
 %%% Internal check functions
@@ -362,14 +462,14 @@ check_curve25519_module_does_it_work(Module) ->
 	GeneratedPK = Module:eddsa_secret_to_public(GeneratedSecret),
 	%% RFC 8032, section 7.1, blank-message Ed25519 test vector.
 	BlankSecret = base64:decode(<<
-		"nWGyPkrYNjJyl6j2RX9R71uEJfnCY1qWb0H8Qs+c9vA="
+		"nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A="
 	>>),
 	BlankPK = base64:decode(<<
-		"11qYAYdk9JMCdjR2QYEE8yL4h9tYNaG7N+aF6R1YlkI="
+		"11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
 	>>),
 	BlankSignature = base64:decode(<<
-		"5Vb7cXgEcj7uHLiRPB8YPhAsgubLhxy9Hh2j9xG5VZlM9gJ3fxQZE2zBvmNsM5ELaXaBKqYcptLW"
-		"sI6N9gXjAA=="
+		"5VZDAMNgrHKQhuLMgG6CioSHfx645dl02HPgZSJJAVVfuIIVkKM7rMYeOXAc+bRr0lv18FlbviRl"
+		"UUFDjnoQCw=="
 	>>),
 	true = check_ed25519_vector(Module, BlankSecret, BlankPK, <<>>, BlankSignature),
 	%% RFC 8032, section 7.1, one-octet Ed25519 test vector.
