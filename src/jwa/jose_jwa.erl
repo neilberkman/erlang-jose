@@ -190,10 +190,10 @@ crypto_supports() ->
 		{shake256, fun() -> jose_sha3:shake256(<<>>, 0) end}
 	]),
 	ExternalPublicKeys = external_checks([
-		{ed25519, fun jose_curve25519:eddsa_keypair/0},
-		{ed25519ph, fun jose_curve25519:eddsa_keypair/0},
-		{ed448, fun jose_curve448:eddsa_keypair/0},
-		{ed448ph, fun jose_curve448:eddsa_keypair/0},
+		{ed25519, fun() -> check_eddsa(jose_curve25519, ed25519_sign, ed25519_verify) end},
+		{ed25519ph, fun() -> check_eddsa(jose_curve25519, ed25519ph_sign, ed25519ph_verify) end},
+		{ed448, fun() -> check_eddsa(jose_curve448, ed448_sign, ed448_verify) end},
+		{ed448ph, fun() -> check_eddsa(jose_curve448, ed448ph_sign, ed448ph_verify) end},
 		{x25519, fun jose_curve25519:x25519_keypair/0},
 		{x448, fun jose_curve448:x448_keypair/0}
 	]),
@@ -389,6 +389,14 @@ unsecured_signing(Boolean) when is_boolean(Boolean) ->
 %%%-------------------------------------------------------------------
 %%% Internal functions
 %%%-------------------------------------------------------------------
+
+%% @private
+check_eddsa(Module, Sign, Verify) ->
+	{PK, SK} = Module:eddsa_keypair(),
+	Message = <<"jose_jwa:crypto_supports/0">>,
+	Signature = erlang:apply(Module, Sign, [Message, SK]),
+	true = erlang:apply(Module, Verify, [Signature, Message, PK]),
+	true.
 
 %% @private
 constant_time_compare(<< AH, AT/binary >>, << BH, BT/binary >>, R) ->

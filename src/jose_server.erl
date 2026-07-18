@@ -409,9 +409,8 @@ check_curve448_modules(Fallback, [Module | Modules]) ->
 	case code:ensure_loaded(Module) of
 		{module, Module} ->
 			_ = application:ensure_all_started(Module),
-			RealFallback = jose_jwa_curve448,
 			RealModule = check_curve448_module(Module),
-			try check_curve448_module_does_it_work(RealFallback, RealModule) of
+			try check_curve448_module_does_it_work(RealModule) of
 				true ->
 					RealModule;
 				false ->
@@ -427,26 +426,25 @@ check_curve448_modules(Fallback, []) ->
 	Fallback.
 
 %% @private
-check_curve448_module_does_it_work(Fallback, Module) ->
-	{PK, SK = <<Secret:57/binary, _:57/binary>>} = Module:eddsa_keypair(),
+check_curve448_module_does_it_work(Module) ->
+	{GeneratedPK, <<GeneratedSecret:57/binary, GeneratedPK:57/binary>>} = Module:eddsa_keypair(),
+	GeneratedPK = Module:eddsa_secret_to_public(GeneratedSecret),
+	%% RFC 8032, section 7.4, blank-message Ed448 test vector.
+	Secret = base64:decode(<<
+		"bIKlYsuAjRDWMr6JyFE+v2ySnzTd+oyfY8mWDvbjSKNSjIo/zC8ETjmj/FuUSS+PAy51SaIAmPlb"
+	>>),
+	PK = base64:decode(<<
+		"X9dEm1m0Yf0s54fsYWrUah2hNCSFpw4fig6nXYDpZ3jt8SR2m0bHBhvWeD3x5Q9s0foavq/oJWGA"
+	>>),
+	Signature = base64:decode(<<
+		"Uzo39rvkVyUfAjwNiPl2ri37UEqEPjTSB0/YI9QaWR8rIz8DT2KCgfL9eiLd1H14KMWb0KIb/TmA/"
+		"w0gKNSxip32PgBsXRwtNFuSXY3AC0EEhS25msXHzdqFMKEToPTbthFJ8FpzYyaMcdlYCP8uZSYA"
+	>>),
+	Message = <<>>,
 	{PK, SK} = Module:eddsa_keypair(Secret),
 	PK = Module:eddsa_secret_to_public(Secret),
-	Message = crypto:strong_rand_bytes(16),
 	Signature = Module:ed448_sign(Message, SK),
-	true = Module:ed448_verify(Signature, Message, PK),
-	true = Fallback:ed448_verify(Signature, Message, PK),
-	%% NOTE: Ed448ph is lower priority, no need to check for now.
-	% Ctx = <<"ctx">>,
-	% CtxSignature = Module:ed448_sign(Message, SK, Ctx),
-	% true = Module:ed448_verify(CtxSignature, Message, PK, Ctx),
-	% true = Fallback:ed448_verify(CtxSignature, Message, PK, Ctx),
-	% PHSignature = Module:ed448ph_sign(Message, SK),
-	% true = Module:ed448ph_verify(PHSignature, Message, PK),
-	% true = Fallback:ed448ph_verify(PHSignature, Message, PK),
-	% CtxPHSignature = Module:ed448ph_sign(Message, SK, Ctx),
-	% true = Module:ed448ph_verify(CtxPHSignature, Message, PK, Ctx),
-	% true = Fallback:ed448ph_verify(CtxPHSignature, Message, PK, Ctx),
-	true.
+	true = Module:ed448_verify(Signature, Message, PK).
 
 %% @private
 check_json(_Fallback, Entries) ->
